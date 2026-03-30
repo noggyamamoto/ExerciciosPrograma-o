@@ -1,85 +1,93 @@
 /*
- * - Teste de taxa de amostragem de 3000 Hz (intervalo ~333 µs)
- * - Quantificação de perda de amostras
- * - Escrita em cartão SD no formato CSV (time_ms, n_adc, adc_value)
- *
+ * ============================================================================
+ * Teste de taxa de amostragem de 3000 Hz (intervalo ~333 µs)
+ * Quantificação de perda de amostras e escrita em cartão SD no formato CSV
  * Plataforma: ESP32 (ESP-IDF via PlatformIO, board = esp32doit-devkit-v1)
- * 
- *
+ * Autor: João Nogueira
+ * ============================================================================
  */
 
-// ==================== BIBLIOTECAS PADRÃO ====================
-#include <stdio.h>      // Funções padrão de entrada/saída (printf, fprintf, etc.)
-#include <stdlib.h>     // Funções utilitárias (atoi, malloc, free)
+// =========================== BIBLIOTECAS PADRÃO ===========================
+#include <stdio.h>      // Funções de entrada/saída padrão (printf, fprintf, etc.)
+#include <stdlib.h>     // Funções utilitárias (atoi, malloc, free, etc.)
 #include <string.h>     // Manipulação de strings (strlen, strftime)
 #include <stdarg.h>     // Suporte a argumentos variáveis (vsnprintf)
 #include <time.h>       // Funções de tempo (time, localtime, strftime)
 
-// ==================== BIBLIOTECAS DO FREERTOS ====================
-#include "freertos/FreeRTOS.h"   // Kernel do FreeRTOS
-#include "freertos/task.h"       // Tarefas e delays (vTaskDelay)
+// =========================== BIBLIOTECAS DO FREERTOS ======================
+#include "freertos/FreeRTOS.h"   // Kernel do FreeRTOS (tipos e macros)
+#include "freertos/task.h"       // Funções de tarefas (vTaskDelay)
 
-// ==================== BIBLIOTECAS DO ESP-IDF ====================
+// =========================== BIBLIOTECAS DO ESP-IDF =======================
 #include "driver/uart.h"         // Driver para comunicação serial (UART)
 #include "driver/gpio.h"         // Controle dos pinos GPIO
-#include "esp_adc/adc_oneshot.h" // Driver para ADC no modo oneshot
-#include "esp_adc/adc_cali.h"    // Calibração do ADC
+#include "esp_adc/adc_oneshot.h" // Driver para ADC no modo "oneshot"
+#include "esp_adc/adc_cali.h"    // Calibração do ADC (não usado diretamente)
 #include "esp_adc/adc_cali_scheme.h" // Esquemas de calibração
 #include "esp_timer.h"           // Timer de alta resolução do ESP32
-#include "driver/sdmmc_host.h"   // Host para cartão SD via SDMMC
+#include "driver/sdmmc_host.h"   // Host para cartão SD via SDMMC (não usado aqui)
 #include "driver/sdspi_host.h"   // Host para cartão SD via SPI
 #include "sdmmc_cmd.h"           // Comandos para SDMMC
 #include "esp_vfs_fat.h"         // Sistema de arquivos FAT no ESP32
+#include "esp_heap_caps.h"       // Para consultar a memória heap disponível
 
-// ================= CONFIGURAÇÃO DA UART =================
+// =========================== CONFIGURAÇÃO DA UART =========================
 #define UART_PORT       UART_NUM_0      // Usa a UART0 (pinos padrão TX=GPIO1, RX=GPIO3)
 #define TXD_PIN         GPIO_NUM_1      // Pino de transmissão (TX)
 #define RXD_PIN         GPIO_NUM_3      // Pino de recepção (RX)
-#define BUF_SIZE        1024            // Tamanho do buffer da UART
+#define BUF_SIZE        1024            // Tamanho do buffer interno da UART
 #define UART_TIMEOUT_MS 10000           // Timeout para leitura (10 segundos)
 
-// ================= CONFIGURAÇÃO DO ADC =================
+// =========================== CONFIGURAÇÃO DO ADC ==========================
 #define ADC1_CHAN0      ADC_CHANNEL_0   // Canal 0 do ADC1 (GPIO36)
 #define ADC1_CHAN1      ADC_CHANNEL_3   // Canal 3 do ADC1 (GPIO39)
-#define ADC_ATTEN       ADC_ATTEN_DB_12 
-#define ADC_BITWIDTH    ADC_BITWIDTH_12 
+#define ADC_ATTEN       ADC_ATTEN_DB_12 // Atenuação de 12dB (faixa 0-3.3V)
+#define ADC_BITWIDTH    ADC_BITWIDTH_12 // Resolução de 12 bits (0-4095)
 
-// ================= CONFIGURAÇÃO DO TESTE DE ALTA TAXA =================
-#define TAXA_AMOSTRAGEM_HZ      3000        // Taxa desejada: 3000 amostras por segundo (por canal)
-#define INTERVALO_US            333         // Intervalo entre amostras: 1.000.000 µs / 3000 ≈ 333 µs
-#define DURACAO_TESTE_SEGUNDOS  2           // Duração da coleta: 2 segundos
-#define NUM_AMOSTRAS_TOTAL      30000       // Número total de amostras: 3000 Hz * 2 s * 2 canais = 12000
-#define NUM_CANAIS              2           // Dois canais de ADC
+// =========================== CONFIGURAÇÃO DO TESTE DE ALTA TAXA ===========
+#define TAXA_AMOSTRAGEM_HZ      3000                // Taxa desejada: 3000 amostras por segundo (por canal)
+#define INTERVALO_US            333                 // Intervalo entre amostras: 1.000.000 µs / 3000 ≈ 333 µs
+#define DURACAO_TESTE_SEGUNDOS  2                   // Duração da coleta: 2 segundos
+#define NUM_AMOSTRAS_TOTAL      6000                // Número total de amostras: 3000 Hz * 2 s * 2 canais = 6000
+#define NUM_CANAIS              2                   // Dois canais de ADC
 
-// ================= CONFIGURAÇÃO DO SD CARD =================
+// =========================== CONFIGURAÇÃO DO SD CARD ======================
 #define PIN_NUM_MISO    19      // Pino MISO (Master In Slave Out) do barramento SPI
 #define PIN_NUM_MOSI    23      // Pino MOSI (Master Out Slave In)
 #define PIN_NUM_CLK     18      // Pino de clock (SCK)
 #define PIN_NUM_CS      5       // Pino de chip select (CS) para o cartão SD
 #define MOUNT_POINT     "/sdcard"  // Ponto de montagem no sistema de arquivos virtual
 
-// ================= ESTRUTURA PARA ARMAZENAR AMOSTRAS =================
+// =========================== ESTRUTURA PARA ARMAZENAR AMOSTRAS ============
 typedef struct {
     uint32_t timestamp_ms;      // Timestamp em milissegundos (tempo absoluto)
     uint8_t canal;              // Número do canal (0 ou 1)
     uint16_t valor;             // Valor do ADC (12 bits, 0-4095)
 } amostra_t;
 
-// ================= VARIÁVEIS GLOBAIS (compartilhadas com o callback do timer) =================
-static amostra_t *amostras_buffer = NULL;          // Ponteiro para buffer dinâmico de amostras
-static volatile int amostras_coletadas = 0;        // Contador de amostras já armazenadas (volátil para acesso em ISR)
+// =========================== BUFFER ESTÁTICO (SEM ALOCAÇÃO DINÂMICA) ======
+// Agora a memória é reservada na compilação, eliminando o risco de falha de malloc.
+static amostra_t amostras_buffer[NUM_AMOSTRAS_TOTAL];
+
+// =========================== VARIÁVEIS DE CONTROLE GLOBAIS =================
+static volatile int amostras_coletadas = 0;        // Contador de amostras já armazenadas (volátil para uso em ISR)
 static volatile bool coleta_finalizada = false;    // Flag indicando que a coleta terminou (buffer cheio ou tempo esgotado)
-static const int MAX_AMOSTRAS = NUM_AMOSTRAS_TOTAL; // Tamanho máximo do buffer (constante)
 static adc_oneshot_unit_handle_t adc_handle_global = NULL; // Handle do ADC (global para uso no callback)
 
-// ================= FUNÇÕES DE COMUNICAÇÃO SERIAL =================
+// =========================== FUNÇÕES DE COMUNICAÇÃO SERIAL =================
+/**
+ * Envia uma string pela UART.
+ * @param str String terminada em nulo a ser enviada.
+ */
 void uart_send_string(const char *str) {
-    // Envia uma string pela UART usando a função do driver.
     uart_write_bytes(UART_PORT, str, strlen(str));
 }
 
+/**
+ * Função similar ao printf, mas envia pela UART.
+ * Suporta formatação de string com argumentos variáveis.
+ */
 void uart_printf(const char *format, ...) {
-    // Função similar ao printf, mas envia pela UART.
     char buffer[512];
     va_list args;
     va_start(args, format);
@@ -88,8 +96,11 @@ void uart_printf(const char *format, ...) {
     uart_send_string(buffer); // Envia o buffer formatado
 }
 
+/**
+ * Lê uma linha do terminal (até ENTER) e armazena em 'buffer'.
+ * Retorna o número de caracteres lidos ou -1 em caso de timeout.
+ */
 int uart_gets(char *buffer, int max_len) {
-    // Lê uma linha do terminal (até ENTER) e armazena em 'buffer'.
     int idx = 0;
     while (idx < max_len - 1) {
         uint8_t c;
@@ -113,18 +124,16 @@ int uart_gets(char *buffer, int max_len) {
     return idx;
 }
 
-// ================= FUNÇÕES DE LOG =================
+// =========================== FUNÇÕES DE LOG ===============================
 void log_erro(const char *mensagem) {
-    // Exibe uma mensagem de erro no formato [ERRO] texto
     uart_printf("[ERRO] %s\n", mensagem);
 }
 
 void log_info(const char *mensagem) {
-    // Exibe uma mensagem informativa no formato [INFO] texto
     uart_printf("[INFO] %s\n", mensagem);
 }
 
-// ================= FUNÇÕES DO PROGRAMA ORIGINAL =================
+// =========================== FUNÇÕES DO PROGRAMA ORIGINAL =================
 int somar(int a, int b) {
     return a + b;
 }
@@ -136,9 +145,12 @@ void verificarPar(int numero) {
         uart_printf("O numero %d eh IMPAR.\n", numero);
 }
 
-// ================= FUNÇÕES PARA SD CARD =================
+// =========================== FUNÇÕES PARA SD CARD =========================
+/**
+ * Inicializa o cartão SD no modo SPI, monta o sistema de arquivos e retorna o ponteiro do cartão.
+ * Em caso de falha, retorna NULL.
+ */
 sdmmc_card_t* inicializar_sd_card(void) {
-    // Inicializa o cartão SD no modo SPI, monta o sistema de arquivos e retorna o ponteiro do cartão.
     esp_err_t ret;
     sdmmc_card_t *card = NULL;
 
@@ -151,7 +163,7 @@ sdmmc_card_t* inicializar_sd_card(void) {
         .mosi_io_num = PIN_NUM_MOSI,   // Pino MOSI
         .miso_io_num = PIN_NUM_MISO,   // Pino MISO
         .sclk_io_num = PIN_NUM_CLK,    // Pino de clock
-        .quadwp_io_num = -1,           // Não usado
+        .quadwp_io_num = -1,           // Não usado (quad mode desabilitado)
         .quadhd_io_num = -1,           // Não usado
         .max_transfer_sz = 4000,       // Tamanho máximo de transferência
     };
@@ -192,8 +204,12 @@ sdmmc_card_t* inicializar_sd_card(void) {
     return card;
 }
 
+/**
+ * Escreve o buffer de amostras em um arquivo CSV no cartão SD.
+ * @param caminho_arquivo Nome completo do arquivo a ser criado.
+ * @return ESP_OK em sucesso, ESP_FAIL em erro.
+ */
 esp_err_t escrever_csv(const char *caminho_arquivo) {
-    // Escreve o buffer de amostras em um arquivo CSV no cartão SD.
     FILE *f = fopen(caminho_arquivo, "w"); // Abre o arquivo para escrita (modo texto)
     if (f == NULL) {
         log_erro("Falha ao criar arquivo CSV");
@@ -205,7 +221,6 @@ esp_err_t escrever_csv(const char *caminho_arquivo) {
 
     // Percorre todas as amostras coletadas e escreve cada uma no arquivo
     for (int i = 0; i < amostras_coletadas; i++) {
-        // Usa %lu para uint32_t, %u para uint8_t e uint16_t
         fprintf(f, "%lu,%u,%u\n",
                 (unsigned long)amostras_buffer[i].timestamp_ms,
                 amostras_buffer[i].canal,
@@ -217,10 +232,23 @@ esp_err_t escrever_csv(const char *caminho_arquivo) {
     return ESP_OK;
 }
 
-// ================= CALLBACK DO TIMER =================
-// Esta função será chamada pelo timer de hardware a cada INTERVALO_US (333 µs)
+// =========================== FUNÇÃO PARA MOSTRAR MEMÓRIA LIVRE ============
+/**
+ * Exibe a quantidade de heap livre (DRAM) no terminal.
+ * @param mensagem Texto descritivo a ser exibido junto com o valor.
+ */
+void mostrar_memoria_livre(const char *mensagem) {
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    uart_printf("[MEM] %s: %u bytes livres\n", mensagem, free_heap);
+}
+
+// =========================== CALLBACK DO TIMER ============================
+/**
+ * Função chamada pelo timer de hardware a cada INTERVALO_US (333 µs).
+ * Realiza a leitura dos dois canais ADC e armazena as amostras no buffer estático.
+ */
 void timer_callback(void *arg) {
-    // Verifica se a coleta já foi finalizada (buffer cheio ou tempo esgotado)
+    // Se a coleta já foi finalizada, não faz nada
     if (coleta_finalizada) return;
 
     // Obtém o timestamp atual em microssegundos e converte para milissegundos
@@ -232,7 +260,7 @@ void timer_callback(void *arg) {
     // Lê o canal 0 (ADC1_CHAN0)
     if (adc_oneshot_read(adc_handle_global, ADC1_CHAN0, &adc0_raw) == ESP_OK) {
         // Se a leitura foi bem-sucedida e ainda há espaço no buffer, armazena a amostra
-        if (amostras_coletadas < MAX_AMOSTRAS) {
+        if (amostras_coletadas < NUM_AMOSTRAS_TOTAL) {
             amostras_buffer[amostras_coletadas].timestamp_ms = timestamp_ms;
             amostras_buffer[amostras_coletadas].canal = 0;
             amostras_buffer[amostras_coletadas].valor = (uint16_t)adc0_raw;
@@ -242,7 +270,7 @@ void timer_callback(void *arg) {
 
     // Lê o canal 1 (ADC1_CHAN1)
     if (adc_oneshot_read(adc_handle_global, ADC1_CHAN1, &adc1_raw) == ESP_OK) {
-        if (amostras_coletadas < MAX_AMOSTRAS) {
+        if (amostras_coletadas < NUM_AMOSTRAS_TOTAL) {
             amostras_buffer[amostras_coletadas].timestamp_ms = timestamp_ms;
             amostras_buffer[amostras_coletadas].canal = 1;
             amostras_buffer[amostras_coletadas].valor = (uint16_t)adc1_raw;
@@ -251,27 +279,24 @@ void timer_callback(void *arg) {
     }
 
     // Se o buffer estiver cheio, sinaliza que a coleta terminou
-    if (amostras_coletadas >= MAX_AMOSTRAS) {
+    if (amostras_coletadas >= NUM_AMOSTRAS_TOTAL) {
         coleta_finalizada = true;
     }
 }
 
-// ================= TESTE DE ALTA TAXA DE AMOSTRAGEM =================
+// =========================== TESTE DE ALTA TAXA DE AMOSTRAGEM =============
 void testar_alta_taxa(adc_oneshot_unit_handle_t adc_handle) {
     // Exibe mensagens de início do teste
     uart_printf("\n===== INICIANDO TESTE DE ALTA TAXA (3000 Hz) =====\n");
     uart_printf("Intervalo entre amostras: %d µs\n", INTERVALO_US);
     uart_printf("Duração do teste: %d segundos\n", DURACAO_TESTE_SEGUNDOS);
-    uart_printf("Amostras esperadas (2 canais): %d\n\n", NUM_AMOSTRAS_TOTAL);
+    uart_printf("Tamanho do buffer: %d amostras (%d bytes)\n",
+                NUM_AMOSTRAS_TOTAL, (int)(NUM_AMOSTRAS_TOTAL * sizeof(amostra_t)));
 
-    // Aloca dinamicamente o buffer para armazenar as amostras
-    amostras_buffer = (amostra_t*)malloc(MAX_AMOSTRAS * sizeof(amostra_t));
-    if (amostras_buffer == NULL) {
-        log_erro("Falha ao alocar buffer de amostras");
-        return;
-    }
+    // Mostra memória livre antes da coleta
+    mostrar_memoria_livre("Antes da coleta");
 
-    // Inicializa as variáveis de controle
+    // Reinicia contadores (buffer já está alocado estaticamente)
     amostras_coletadas = 0;
     coleta_finalizada = false;
     adc_handle_global = adc_handle;  // Guarda o handle do ADC para uso no callback
@@ -286,8 +311,6 @@ void testar_alta_taxa(adc_oneshot_unit_handle_t adc_handle) {
     esp_err_t ret = esp_timer_create(&timer_args, &timer);
     if (ret != ESP_OK) {
         log_erro("Falha ao criar timer");
-        free(amostras_buffer);
-        amostras_buffer = NULL;
         return;
     }
 
@@ -323,6 +346,9 @@ void testar_alta_taxa(adc_oneshot_unit_handle_t adc_handle) {
     uart_printf("Perda: %.2f%%\n", perda_percentual);
     uart_printf("Taxa efetiva: %.1f Hz\n", (amostras_reais / 2) / tempo_real_segundos);
 
+    // Mostra memória livre após a coleta
+    mostrar_memoria_livre("Após a coleta");
+
     // Tenta salvar os dados no cartão SD
     log_info("Tentando salvar dados no SD card...");
     sdmmc_card_t *card = inicializar_sd_card();
@@ -355,15 +381,10 @@ void testar_alta_taxa(adc_oneshot_unit_handle_t adc_handle) {
         }
     }
 
-    // Libera a memória do buffer
-    free(amostras_buffer);
-    amostras_buffer = NULL;
-    adc_handle_global = NULL;
-
     uart_printf("\n===== FIM DO TESTE =====\n");
 }
 
-// ================= PROGRAMA PRINCIPAL =================
+// =========================== PROGRAMA PRINCIPAL ===========================
 void programa_principal(adc_oneshot_unit_handle_t adc_handle) {
     vTaskDelay(pdMS_TO_TICKS(1000)); // Pequena pausa inicial para estabilização
 
@@ -371,7 +392,7 @@ void programa_principal(adc_oneshot_unit_handle_t adc_handle) {
     uart_printf("Este programa demonstra:\n");
     uart_printf("1) Operações básicas (soma, par/ímpar)\n");
     uart_printf("2) Amostragem padrão a 2 Hz (como antes)\n");
-    uart_printf("3) Teste de alta taxa (3000 Hz) com escrita em SD\n\n");
+    uart_printf("3) Teste de alta taxa (3000 Hz) com buffer estático\n\n");
 
     char buffer[50];
     int numero1 = 0, numero2 = 0;
@@ -417,7 +438,7 @@ void programa_principal(adc_oneshot_unit_handle_t adc_handle) {
     uart_printf("\n===== FIM DO PROGRAMA =====\n");
 }
 
-// ================= FUNÇÃO PRINCIPAL =================
+// =========================== FUNÇÃO PRINCIPAL ==============================
 void app_main(void) {
     // -------------------- Configuração da UART --------------------
     uart_config_t uart_config = {
@@ -459,6 +480,9 @@ void app_main(void) {
     if (ret != ESP_OK) log_erro("Falha config canal1");
 
     log_info("ADC configurado.");
+
+    // Mostra memória livre no início
+    mostrar_memoria_livre("Início do programa");
 
     // -------------------- Loop infinito do programa --------------------
     while (1) {
