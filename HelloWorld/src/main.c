@@ -290,6 +290,9 @@ static esp_err_t escrever_csv(const char *caminho_arquivo) {
     // Abre o arquivo CSV para escrita
     FILE *f = fopen(caminho_arquivo, "w");
     if (f == NULL) {
+        //Mostrar se o erro é, ENOENT (diretório não encontrado), 
+        //ENOSPC (sem espaço), EROFS (somente leitura) ou EINVAL.
+        uart_printf("[ERRO] fopen falhou: %s (errno=%d)\n", strerror(errno), errno);
         log_erro("Falha ao criar arquivo CSV");
         return ESP_FAIL;
     }
