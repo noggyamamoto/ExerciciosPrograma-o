@@ -27,6 +27,7 @@
 #include <stdarg.h>     // Argumentos variáveis
 #include <time.h>       // Data e hora para nomear arquivos no SD
 #include <stdbool.h>    // Tipo bool
+#include <errno.h>      // Códigos de erro padrão
 
 // =========================== BIBLIOTECAS DO FREERTOS ======================
 #include "freertos/FreeRTOS.h"     // Kernel do FreeRTOS
@@ -297,7 +298,7 @@ static esp_err_t escrever_csv(const char *caminho_arquivo) {
     static char io_buffer[4096];
     setvbuf(f, io_buffer, _IOFBF, sizeof(io_buffer));
 
-    // Cabeçalho pedido no enunciado
+    // Cabeçalho do CSV
     fprintf(f, "time_ms,n_adc,adc_value\n");
 
     // Copia a quantidade total para uma variável local
