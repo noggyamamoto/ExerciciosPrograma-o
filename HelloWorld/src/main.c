@@ -25,8 +25,8 @@
 #include <stdlib.h>     // Funções utilitárias como atoi
 #include <string.h>     // Manipulação de strings
 #include <stdarg.h>     // Argumentos variáveis
-#include <time.h>       // Data e hora para nomear arquivos no SD
-#include <stdbool.h>    // Tipo bool
+#include <time.h>       // Data e hora para nomear arquivos no SD 
+#include <stdbool.h>    // Tipo bool 
 #include <errno.h>      // Códigos de erro padrão
 
 // =========================== BIBLIOTECAS DO FREERTOS ======================
@@ -302,16 +302,16 @@ static esp_err_t escrever_csv(const char *caminho_arquivo) {
     setvbuf(f, io_buffer, _IOFBF, sizeof(io_buffer));
 
     // Cabeçalho do CSV
-    fprintf(f, "time_ms,n_adc,adc_value\n");
-
+    fprintf(f, "time_ms,n_adc,adc_value\n");    //  Como escrever três colunas respectivamente
+                                                //  time_ms,n_adc,adc_value?
     // Copia a quantidade total para uma variável local
     int total = amostras_coletadas;
 
-    // Percorre o buffer e grava cada linha do CSV
-    for (int i = 0; i < total; i++) {
+    // Percorre o buffer e grava cada linha do CSV  || // Como escrever os valores nas linhas e colunas do CSV,
+    for (int i = 0; i < total; i++) {                       // campos time_ms, n_adc e adc_value?
         fprintf(
-            f,
-            "%lu,%u,%u\n",
+            f,                                    
+            "%lu,%u,%u\n",                       
             (unsigned long)amostras_buffer[i].time_ms,
             amostras_buffer[i].n_adc,
             amostras_buffer[i].adc_value
@@ -602,25 +602,33 @@ static void testar_alta_taxa_e_salvar_csv(void) {
     sdmmc_card_t *card = inicializar_sd_card();
 
     if (card != NULL) {
-        // Gera um nome de arquivo com data e hora
-        char caminho_csv[128];
-        time_t agora = time(NULL);
-        struct tm tm_info;
-        localtime_r(&agora, &tm_info);
-
-        strftime(
-            caminho_csv,
-            sizeof(caminho_csv),
-            MOUNT_POINT "/amostras_%Y%m%d_%H%M%S.csv",
-            &tm_info
-        );
-
-        // Escreve o CSV
-        if (escrever_csv(caminho_csv) == ESP_OK) {
-            uart_printf("Arquivo CSV salvo: %s\n", caminho_csv);
+        // Substituição temporária por um nome fixo para facilitar testes iniciais
+        const char *caminho_teste = MOUNT_POINT "/teste.csv";
+        uart_printf("Testando com caminho fixo: '%s'\n", caminho_teste);
+        if (escrever_csv(caminho_teste) == ESP_OK) {
+            uart_printf("Arquivo fixo salvo com sucesso!\n");
         } else {
-            log_erro("Falha ao salvar o arquivo CSV");
+            uart_printf("Falha também com caminho fixo.\n");
         }
+
+        //Gera um nome de arquivo com data e hora
+        //char caminho_csv[128];
+        //time_t agora = time(NULL);
+        //struct tm tm_info;
+        //localtime_r(&agora, &tm_info);
+
+        //strftime(
+            //caminho_csv,
+            //sizeof(caminho_csv),
+            //MOUNT_POINT "/amostras_%Y%m%d_%H%M%S.csv",
+            //&tm_info
+        //);
+        // Escreve o CSV
+        //if (escrever_csv(caminho_csv) == ESP_OK) {
+        //    //uart_printf("Arquivo CSV salvo: %s\n", caminho_csv);
+        //} else {
+        //    //log_erro("Falha ao salvar o arquivo CSV");
+        //}
 
         // Desmonta o cartão e libera o barramento SPI
         esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
