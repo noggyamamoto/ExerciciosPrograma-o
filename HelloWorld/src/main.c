@@ -16,7 +16,7 @@
  * - Core 0: comunicação / menu / interação com o usuário
  * - Core 1: aquisição em alta taxa
  * - Mutex: proteção da RAM compartilhada
- * - esp_timer: temporização precisa em microssegundos
+ * - ADC contínuo com DMA para alta taxa
  * ============================================================================ 
  */
 
@@ -41,7 +41,8 @@
 #include "esp_timer.h"             // Timer de alta resolução
 #include "esp_heap_caps.h"         // Memória livre
 
-#include "esp_adc/adc_oneshot.h"   // ADC em modo oneshot
+#include "esp_adc/adc_oneshot.h"   // ADC oneshot para as tarefas 2, 3 e 4
+#include "esp_adc/adc_continuous.h" // ADC contínuo para o teste de alta taxa 
 #include "driver/sdspi_host.h"     // SD via SPI
 #include "sdmmc_cmd.h"             // Estruturas do cartão SD
 #include "esp_vfs_fat.h"           // FAT + VFS
@@ -54,19 +55,29 @@
 #define UART_TX_BUF_SIZE        2048         // Buffer TX interno do driver
 #define UART_LINE_TIMEOUT_MS    10000        // Timeout para ler uma linha inteira
 
-// =========================== CONFIGURAÇÃO DO ADC ==========================
+// =========================== CONFIGURAÇÃO DO ADC ONESHOT ==================
 #define ADC1_CHAN0              ADC_CHANNEL_0  // GPIO36
 #define ADC1_CHAN1              ADC_CHANNEL_3  // GPIO39
 #define ADC_ATTEN               ADC_ATTEN_DB_12
-#define ADC_BITWIDTH            ADC_BITWIDTH_12
+#define ADC_ONESHOT_BITWIDTH    ADC_BITWIDTH_12  
 
-// =========================== CONFIGURAÇÃO DO TESTE =======================
-#define HIGH_RATE_HZ            3000          // 3000 amostras por segundo por canal
-#define HIGH_RATE_DURATION_S    2             // Duração do teste em segundos
-#define NUM_CHANNELS            2             // Dois canais analógicos
-#define HIGH_RATE_PERIOD_US     (1000000UL / HIGH_RATE_HZ)   // 333 us
-#define NUM_TICKS_TOTAL         (HIGH_RATE_HZ * HIGH_RATE_DURATION_S)
-#define NUM_AMOSTRAS_TOTAL      (NUM_TICKS_TOTAL * NUM_CHANNELS) // 3000*2*2 = 12000
+// =========================== CONFIGURAÇÃO DO ADC CONTÍNUO (DMA) ============
+#define ADC_CONTINUOUS_UNIT     ADC_UNIT_1
+#define ADC_CONTINUOUS_CHAN0    ADC_CHANNEL_0   // GPIO36
+#define ADC_CONTINUOUS_CHAN1    ADC_CHANNEL_3   // GPIO39
+#define ADC_ATTEN_DB            ADC_ATTEN_DB_12
+#define ADC_CONTINUOUS_BITWIDTH SOC_ADC_DIGI_MAX_BITWIDTH 
+
+// =========================== CONFIGURAÇÃO DO TESTE DE ALTA TAXA ===========
+// Frequência total de amostragem (soma dos dois canais)
+// 3000 amostras por segundo por canal -> 6000 amostras/seg total
+#define HIGH_RATE_TOTAL_HZ      6000
+#define HIGH_RATE_DURATION_S    2
+#define NUM_CHANNELS            2
+#define NUM_AMOSTRAS_TOTAL      (HIGH_RATE_TOTAL_HZ * HIGH_RATE_DURATION_S)  // 12000
+
+// Configuração do buffer DMA (tamanho em bytes)
+#define DMA_BUFFER_SIZE         4096    // suficiente para centenas de amostras
 
 // =========================== CONFIGURAÇÃO DO SD CARD ======================
 #define PIN_NUM_MISO            19
@@ -88,40 +99,37 @@ static volatile int amostras_coletadas = 0;           // Quantidade de registros
 static volatile bool coleta_finalizada = false;       // Flag de fim da coleta
 
 // =========================== RECURSOS COMPARTILHADOS ======================
-static SemaphoreHandle_t g_ram_mutex = NULL;         // Mutex para proteger RAM compartilhada
-static adc_oneshot_unit_handle_t g_adc_handle = NULL; // Handle global do ADC
-static TaskHandle_t g_acquisition_task_handle = NULL; // Task de aquisição
-static esp_timer_handle_t g_high_rate_timer = NULL;   // Timer periódico do teste
+static SemaphoreHandle_t g_ram_mutex = NULL;         // Protege o buffer
+static adc_oneshot_unit_handle_t g_oneshot_handle = NULL;  // Para testes básicos
+static adc_continuous_handle_t g_cont_handle = NULL;      // Para alta taxa (DMA)
+static TaskHandle_t g_acquisition_task_handle = NULL;
 
-static volatile bool g_high_rate_active = false;      // Indica se o teste 3000 Hz está ativo
+static volatile bool g_high_rate_active = false;      // Controla a coleta ativa
+static uint64_t g_start_time_us = 0;                  // Início da coleta
 
 // =========================== PROTÓTIPOS ===================================
 static void uart_send_string(const char *str);
 static void uart_printf(const char *format, ...);
 static int uart_gets(char *buffer, int max_len);
-
 static void log_erro(const char *mensagem);
 static void log_info(const char *mensagem);
 static void mostrar_memoria_livre(const char *mensagem);
-
 static int somar(int a, int b);
 static void verificarPar(int numero);
-
 static sdmmc_card_t *inicializar_sd_card(void);
 static esp_err_t escrever_csv(const char *caminho_arquivo);
-
 static void teste_entrada_saida_serial(void);
 static void teste_leitura_adc_simples(void);
 static void teste_leitura_adc_duplo(void);
 static void teste_amostragem_periodica_1_canal(uint32_t frequencia_hz, uint8_t canal);
 static void testar_alta_taxa_e_salvar_csv(void);
-
 static void adc_acquisition_task(void *pvParameters);
-static void high_rate_timer_callback(void *arg);
+// Protótipo do callback sem IRAM_ATTR (o atributo fica apenas na definição)
+static bool continuous_adc_callback(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data);
 static void registrar_amostra(uint8_t canal, uint16_t valor, uint32_t time_ms);
-
 static void imprimir_menu(void);
 static void comunicacao_task(void *pvParameters);
+static void continuous_adc_init(adc_continuous_handle_t *out_handle);
 
 // =========================== UART: ENVIO ==================================
 static void uart_send_string(const char *str) {
@@ -363,7 +371,7 @@ static void teste_leitura_adc_simples(void) {
     int adc_raw = 0;
 
     // Lê o canal ADC1_CHAN0
-    if (adc_oneshot_read(g_adc_handle, ADC1_CHAN0, &adc_raw) == ESP_OK) {
+    if (adc_oneshot_read(g_oneshot_handle, ADC1_CHAN0, &adc_raw) == ESP_OK) {
         uart_printf("ADC0 (GPIO36) = %d\n", adc_raw);
     } else {
         log_erro("Falha ao ler ADC0");
@@ -380,12 +388,12 @@ static void teste_leitura_adc_duplo(void) {
     int adc1_raw = 0;
 
     // Lê o canal 0
-    if (adc_oneshot_read(g_adc_handle, ADC1_CHAN0, &adc0_raw) != ESP_OK) {
+    if (adc_oneshot_read(g_oneshot_handle, ADC1_CHAN0, &adc0_raw) != ESP_OK) {
         log_erro("Falha ao ler ADC0");
     }
 
     // Lê o canal 1
-    if (adc_oneshot_read(g_adc_handle, ADC1_CHAN1, &adc1_raw) != ESP_OK) {
+    if (adc_oneshot_read(g_oneshot_handle, ADC1_CHAN1, &adc1_raw) != ESP_OK) {
         log_erro("Falha ao ler ADC1");
     }
 
@@ -424,9 +432,9 @@ static void teste_amostragem_periodica_1_canal(uint32_t frequencia_hz, uint8_t c
         // Lê o canal pedido
         esp_err_t ret = ESP_FAIL;
         if (canal == 0) {
-            ret = adc_oneshot_read(g_adc_handle, ADC1_CHAN0, &adc_raw);
+            ret = adc_oneshot_read(g_oneshot_handle, ADC1_CHAN0, &adc_raw);
         } else {
-            ret = adc_oneshot_read(g_adc_handle, ADC1_CHAN1, &adc_raw);
+            ret = adc_oneshot_read(g_oneshot_handle, ADC1_CHAN1, &adc_raw);
         }
 
         if (ret == ESP_OK) {
@@ -439,218 +447,203 @@ static void teste_amostragem_periodica_1_canal(uint32_t frequencia_hz, uint8_t c
     uart_printf("===== FIM DO TESTE =====\n");
 }
 
-// =========================== AMOSTRA AUXILIAR =============================
+// ================== INICIALIZAÇÃO DO ADC CONTÍNUO (DMA) ==================
+static void continuous_adc_init(adc_continuous_handle_t *out_handle) {
+    adc_continuous_handle_t handle = NULL;
+
+    // 1. Configuração básica do driver contínuo
+    adc_continuous_handle_cfg_t handle_cfg = {
+        .max_store_buf_size = DMA_BUFFER_SIZE,   // Tamanho máximo do buffer interno
+        .conv_frame_size = DMA_BUFFER_SIZE,      // Cada frame terá esse tamanho (pode ser menor)
+    };
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &handle));
+
+    // 2. Configuração dos canais e frequência de amostragem
+    //    A frequência total (soma dos canais) será HIGH_RATE_TOTAL_HZ
+    adc_continuous_config_t dig_cfg = {
+        .sample_freq_hz = HIGH_RATE_TOTAL_HZ,
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,     // Usa apenas ADC1
+        .pattern_num = NUM_CHANNELS,
+    };
+
+    // Padrão de amostragem: alterna entre os dois canais
+    adc_digi_pattern_config_t adc_pattern[NUM_CHANNELS] = {0};
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        adc_pattern[i].atten = ADC_ATTEN_DB;
+        adc_pattern[i].channel = (i == 0) ? ADC_CONTINUOUS_CHAN0 : ADC_CONTINUOUS_CHAN1;
+        adc_pattern[i].unit = ADC_CONTINUOUS_UNIT;
+        adc_pattern[i].bit_width = ADC_CONTINUOUS_BITWIDTH;   // Nome corrigido
+    }
+    dig_cfg.adc_pattern = adc_pattern;
+    ESP_ERROR_CHECK(adc_continuous_config(handle, &dig_cfg));
+
+    // 3. Registra o callback que será chamado quando um frame estiver pronto
+    adc_continuous_evt_cbs_t cbs = {
+        .on_conv_done = continuous_adc_callback,   // função chamada na ISR
+    };
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(handle, &cbs, NULL));
+
+    *out_handle = handle;
+}
+
+// =========================== CALLBACK DO ADC CONTÍNUO (ISR) ===============
+// Esta função roda em contexto de interrupção. Deve ser rápida e não pode
+// chamar funções bloqueantes. Apenas notifica a tarefa de aquisição.
+static bool IRAM_ATTR continuous_adc_callback(adc_continuous_handle_t handle,
+                                              const adc_continuous_evt_data_t *edata,
+                                              void *user_data) {
+    BaseType_t mustYield = pdFALSE;
+    // Notifica a tarefa de aquisição de que há dados disponíveis
+    if (g_acquisition_task_handle) {
+        vTaskNotifyGiveFromISR(g_acquisition_task_handle, &mustYield);
+    }
+    return (mustYield == pdTRUE);
+}
+
+// =========================== REGISTRAR AMOSTRA NO BUFFER ==================
 static void registrar_amostra(uint8_t canal, uint16_t valor, uint32_t time_ms) {
-    // Protege a RAM compartilhada enquanto escreve no buffer
     if (amostras_coletadas < NUM_AMOSTRAS_TOTAL) {
         amostras_buffer[amostras_coletadas].time_ms = time_ms;
         amostras_buffer[amostras_coletadas].n_adc = canal;
         amostras_buffer[amostras_coletadas].adc_value = valor;
         amostras_coletadas++;
     }
-
-    // Se o buffer encheu, sinaliza término
     if (amostras_coletadas >= NUM_AMOSTRAS_TOTAL) {
         coleta_finalizada = true;
     }
 }
 
-// =========================== CALLBACK DO TIMER ============================
-static void high_rate_timer_callback(void *arg) {
-    (void)arg; // Parâmetro não utilizado
-
-    // Só notifica enquanto o teste de alta taxa estiver ativo
-    if (g_high_rate_active && g_acquisition_task_handle != NULL) {
-        xTaskNotifyGive(g_acquisition_task_handle); // Acorda a tarefa de aquisição
-    }
-}
-
-// =========================== TAREFA DE AQUISIÇÃO ==========================
+// =========================== TAREFA DE AQUISIÇÃO (CORE 1) =================
+// Esta tarefa é responsável por ler os dados do buffer DMA, parseá-los e
+// armazená-los no buffer de amostras com timestamps teóricos.
 static void adc_acquisition_task(void *pvParameters) {
-    (void)pvParameters; // Parâmetro não utilizado
+    (void)pvParameters;
+    uint8_t *dma_buffer = (uint8_t *)malloc(DMA_BUFFER_SIZE);
+    if (!dma_buffer) {
+        log_erro("Falha ao alocar buffer DMA");
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
     while (1) {
-        // Espera uma notificação do timer
-        uint32_t notifications = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Aguarda notificação do callback (novo frame de dados)
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // Se o teste não estiver ativo, continua esperando
-        if (!g_high_rate_active) {
-            continue;
+        if (!g_high_rate_active) continue;  // Coleta não iniciada ou já terminou
+
+        // Lê os dados disponíveis no driver (não bloqueante, timeout 0)
+        uint32_t bytes_read = 0;
+        esp_err_t ret = adc_continuous_read(g_cont_handle, dma_buffer, DMA_BUFFER_SIZE, &bytes_read, 0);
+        if (ret != ESP_OK || bytes_read == 0) continue;
+
+        // Parse dos dados brutos para estruturas legíveis
+        adc_continuous_data_t *parsed = (adc_continuous_data_t *)dma_buffer;
+        uint32_t num_samples = bytes_read / sizeof(adc_continuous_data_t);
+
+        // Para cada amostra, calcula o timestamp teórico baseado no início da coleta
+        // e no índice global da amostra.
+        for (uint32_t i = 0; i < num_samples; i++) {
+            if (!g_high_rate_active || coleta_finalizada) break;
+
+            uint8_t canal = parsed[i].channel;  // 0 ou 1 (depende do padrão)
+            uint16_t valor = parsed[i].raw_data;
+            // Índice global da amostra: total já coletado + i
+            int idx = amostras_coletadas + i;
+            if (idx >= NUM_AMOSTRAS_TOTAL) break;
+
+            // Tempo teórico em ms desde o início
+            uint64_t tempo_us = g_start_time_us + (idx * (1000000ULL / HIGH_RATE_TOTAL_HZ));
+            uint32_t tempo_ms = (uint32_t)(tempo_us / 1000);
+
+            // Protege o buffer compartilhado
+            xSemaphoreTake(g_ram_mutex, portMAX_DELAY);
+            registrar_amostra(canal, valor, tempo_ms);
+            xSemaphoreGive(g_ram_mutex);
         }
 
-        // Processa todas as notificações acumuladas
-        while (notifications-- > 0 && g_high_rate_active && !coleta_finalizada) {
-            int adc0_raw = 0;
-            int adc1_raw = 0;
-
-            // Timestamp da amostra
-            uint64_t tempo_us = esp_timer_get_time();
-            uint32_t tempo_ms = (uint32_t)(tempo_us / 1000ULL);
-
-            // Lê os dois canais
-            esp_err_t ret0 = adc_oneshot_read(g_adc_handle, ADC1_CHAN0, &adc0_raw);
-            esp_err_t ret1 = adc_oneshot_read(g_adc_handle, ADC1_CHAN1, &adc1_raw);
-
-            // Se as leituras deram certo, grava no buffer
-            if (ret0 == ESP_OK && ret1 == ESP_OK) {
-                // Protege o acesso ao buffer e ao contador
-                xSemaphoreTake(g_ram_mutex, portMAX_DELAY);
-
-                registrar_amostra(0, (uint16_t)adc0_raw, tempo_ms);
-                registrar_amostra(1, (uint16_t)adc1_raw, tempo_ms);
-
-                xSemaphoreGive(g_ram_mutex);
-            }
+        // Se o buffer de amostras encheu, finaliza a coleta
+        if (coleta_finalizada) {
+            g_high_rate_active = false;
         }
     }
+    free(dma_buffer);
 }
 
-// =========================== TESTE DE ALTA TAXA + CSV ====================
+// =========================== TESTE DE ALTA TAXA (DMA) =====================
 static void testar_alta_taxa_e_salvar_csv(void) {
-    uart_printf("\n===== INICIANDO TESTE DE ALTA TAXA (3000 Hz) =====\n");
-    uart_printf("Frequencia por canal: %d Hz\n", HIGH_RATE_HZ);
-    uart_printf("Intervalo: %lu us\n", (unsigned long)HIGH_RATE_PERIOD_US);
+    uart_printf("\n===== INICIANDO TESTE DE ALTA TAXA COM DMA =====\n");
+    uart_printf("Frequencia total: %d Hz (%d Hz por canal)\n", HIGH_RATE_TOTAL_HZ, HIGH_RATE_TOTAL_HZ/NUM_CHANNELS);
     uart_printf("Duracao: %d s\n", HIGH_RATE_DURATION_S);
     uart_printf("Canais: %d\n", NUM_CHANNELS);
     uart_printf("Total esperado de registros: %d\n", NUM_AMOSTRAS_TOTAL);
 
     mostrar_memoria_livre("Antes da coleta");
 
-    // Reinicia os contadores e flags
+    // Prepara o buffer de amostras
     xSemaphoreTake(g_ram_mutex, portMAX_DELAY);
     amostras_coletadas = 0;
     coleta_finalizada = false;
     xSemaphoreGive(g_ram_mutex);
 
+    // Inicializa o ADC contínuo (se já não estiver)
+    if (g_cont_handle == NULL) {
+        continuous_adc_init(&g_cont_handle);
+    }
+
+    // Marca o início da coleta
+    g_start_time_us = esp_timer_get_time();
     g_high_rate_active = true;
 
-    // Cria o timer periódico do teste
-    esp_timer_create_args_t timer_args = {
-        .callback = high_rate_timer_callback,
-        .arg = NULL,
-        .name = "high_rate_timer",
-    };
+    // Inicia a aquisição contínua
+    ESP_ERROR_CHECK(adc_continuous_start(g_cont_handle));
 
-    esp_err_t ret = esp_timer_create(&timer_args, &g_high_rate_timer);
-    if (ret != ESP_OK) {
-        log_erro("Falha ao criar esp_timer do teste de alta taxa");
-        g_high_rate_active = false;
-        return;
-    }
-
-    // Marca o início
-    uint64_t tempo_inicio = esp_timer_get_time();
-
-    // Inicia o timer periódico
-    ret = esp_timer_start_periodic(g_high_rate_timer, HIGH_RATE_PERIOD_US);
-    if (ret != ESP_OK) {
-        log_erro("Falha ao iniciar esp_timer periódico");
-        esp_timer_delete(g_high_rate_timer);
-        g_high_rate_timer = NULL;
-        g_high_rate_active = false;
-        return;
-    }
-
-    // Espera até terminar por buffer cheio ou por tempo máximo
-    uint64_t tempo_limite = tempo_inicio + ((uint64_t)HIGH_RATE_DURATION_S * 1000000ULL);
-
+    // Aguarda o tempo de coleta ou buffer cheio
+    uint64_t tempo_limite = g_start_time_us + (HIGH_RATE_DURATION_S * 1000000ULL);
     while (!coleta_finalizada && esp_timer_get_time() < tempo_limite) {
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    // Encerra a geração de notificações
+    // Finaliza a coleta
     g_high_rate_active = false;
-    esp_timer_stop(g_high_rate_timer);
+    adc_continuous_stop(g_cont_handle);
 
-    // Dá um pequeno tempo para a tarefa de aquisição esvaziar o que estiver pendente
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // Para e remove o timer
-    esp_timer_delete(g_high_rate_timer);
-    g_high_rate_timer = NULL;
-
-    // Marca o fim
     uint64_t tempo_fim = esp_timer_get_time();
-    float tempo_real_segundos = (tempo_fim - tempo_inicio) / 1000000.0f;
+    float tempo_real_segundos = (tempo_fim - g_start_time_us) / 1000000.0f;
 
-    // Quantidade esperada de registros
-    int amostras_esperadas = HIGH_RATE_HZ * HIGH_RATE_DURATION_S * NUM_CHANNELS;
-
-    // Quantidade real
+    int amostras_esperadas = NUM_AMOSTRAS_TOTAL;
     int amostras_reais = amostras_coletadas;
-
-    // Calcula perda
-    float perda_percentual = 0.0f;
-    if (amostras_esperadas > 0) {
-        perda_percentual = 100.0f * (amostras_esperadas - amostras_reais) / amostras_esperadas;
-        if (perda_percentual < 0.0f) {
-            perda_percentual = 0.0f;
-        }
-    }
+    float perda_percentual = 100.0f * (amostras_esperadas - amostras_reais) / amostras_esperadas;
+    if (perda_percentual < 0) perda_percentual = 0;
 
     uart_printf("\n===== RESULTADOS DO TESTE =====\n");
     uart_printf("Tempo real de coleta: %.3f s\n", tempo_real_segundos);
-    uart_printf("Amostras esperadas (registros): %d\n", amostras_esperadas);
-    uart_printf("Amostras reais coletadas: %d\n", amostras_reais);
+    uart_printf("Amostras esperadas: %d\n", amostras_esperadas);
+    uart_printf("Amostras coletadas: %d\n", amostras_reais);
     uart_printf("Perda: %.2f%%\n", perda_percentual);
     uart_printf("Taxa efetiva por canal: %.1f Hz\n", (amostras_reais / (float)NUM_CHANNELS) / tempo_real_segundos);
 
     mostrar_memoria_livre("Após a coleta");
 
-    // Tenta montar o SD e salvar o CSV
-    log_info("Tentando salvar os dados no SD card...");
+    // Salva em SD
+    log_info("Salvando dados no SD...");
     sdmmc_card_t *card = inicializar_sd_card();
-
     if (card != NULL) {
-        // Substituição temporária por um nome fixo para facilitar testes iniciais
-        const char *caminho_teste = MOUNT_POINT "/teste.csv";
-        uart_printf("Testando com caminho fixo: '%s'\n", caminho_teste);
-        if (escrever_csv(caminho_teste) == ESP_OK) {
-            uart_printf("Arquivo fixo salvo com sucesso!\n");
+        const char *caminho = MOUNT_POINT "/teste_dma.csv";
+        if (escrever_csv(caminho) == ESP_OK) {
+            uart_printf("Arquivo salvo: %s\n", caminho);
         } else {
-            uart_printf("Falha também com caminho fixo.\n");
+            log_erro("Falha ao salvar CSV");
         }
-
-        //Gera um nome de arquivo com data e hora
-        //char caminho_csv[128];
-        //time_t agora = time(NULL);
-        //struct tm tm_info;
-        //localtime_r(&agora, &tm_info);
-
-        //strftime(
-            //caminho_csv,
-            //sizeof(caminho_csv),
-            //MOUNT_POINT "/amostras_%Y%m%d_%H%M%S.csv",
-            //&tm_info
-        //);
-        // Escreve o CSV
-        //if (escrever_csv(caminho_csv) == ESP_OK) {
-        //    //uart_printf("Arquivo CSV salvo: %s\n", caminho_csv);
-        //} else {
-        //    //log_erro("Falha ao salvar o arquivo CSV");
-        //}
-
-        // Desmonta o cartão e libera o barramento SPI
         esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
         spi_bus_free(SPI3_HOST);
     } else {
-        log_erro("Cartao SD nao disponivel. Os dados nao foram salvos.");
-
-        // Mostra as primeiras amostras para depuração
-        uart_printf("\nPrimeiras 10 amostras:\n");
-
-        int total_local = amostras_coletadas;
-        for (int i = 0; i < 10 && i < total_local; i++) {
-            uart_printf(
-                "[%lu ms] n_adc=%u, adc_value=%u\n",
-                (unsigned long)amostras_buffer[i].time_ms,
-                amostras_buffer[i].n_adc,
-                amostras_buffer[i].adc_value
-            );
+        log_erro("SD não disponível. Exibindo primeiras 10 amostras:");
+        for (int i = 0; i < 10 && i < amostras_reais; i++) {
+            uart_printf("[%lu ms] n_adc=%u, valor=%u\n",
+                        (unsigned long)amostras_buffer[i].time_ms,
+                        amostras_buffer[i].n_adc,
+                        amostras_buffer[i].adc_value);
         }
     }
-
-    uart_printf("\n===== FIM DO TESTE =====\n");
 }
 
 // =========================== MENU =========================================
@@ -762,21 +755,21 @@ void app_main(void) {
         )
     );
 
-    // ================= ADC =================
+    // ================= ADC ONESHOT =================
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
 
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &g_adc_handle));
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &g_oneshot_handle));
 
     adc_oneshot_chan_cfg_t chan_config = {
         .atten = ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH,
+        .bitwidth = ADC_ONESHOT_BITWIDTH,   // Nome corrigido
     };
 
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc_handle, ADC1_CHAN0, &chan_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc_handle, ADC1_CHAN1, &chan_config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_oneshot_handle, ADC1_CHAN0, &chan_config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_oneshot_handle, ADC1_CHAN1, &chan_config));
 
     // ================= MUTEX =================
     g_ram_mutex = xSemaphoreCreateMutex();
