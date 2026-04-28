@@ -63,21 +63,28 @@
 
 // =========================== CONFIGURAÇÃO DO ADC CONTÍNUO (DMA) ============
 #define ADC_CONTINUOUS_UNIT     ADC_UNIT_1
-#define ADC_CONTINUOUS_CHAN0    ADC_CHANNEL_0   // GPIO36
-#define ADC_CONTINUOUS_CHAN1    ADC_CHANNEL_3   // GPIO39
 #define ADC_ATTEN_DB            ADC_ATTEN_DB_12
-#define ADC_CONTINUOUS_BITWIDTH SOC_ADC_DIGI_MAX_BITWIDTH 
+#define ADC_CONTINUOUS_BITWIDTH SOC_ADC_DIGI_MAX_BITWIDTH
+
+// Mapeamento dos pinos para os canais do ADC1
+#define ADC1_CH0                ADC_CHANNEL_0  // GPIO36
+#define ADC1_CH1                ADC_CHANNEL_1  // GPIO37
+#define ADC1_CH2                ADC_CHANNEL_2  // GPIO38
+#define ADC1_CH3                ADC_CHANNEL_3  // GPIO39
+#define ADC1_CH4                ADC_CHANNEL_4  // GPIO32
+#define ADC1_CH5                ADC_CHANNEL_5  // GPIO33
+#define ADC1_CH6                ADC_CHANNEL_6  // GPIO34
+#define ADC1_CH7                ADC_CHANNEL_7  // GPIO35
 
 // =========================== CONFIGURAÇÃO DO TESTE DE ALTA TAXA ===========
-// Frequência total de amostragem (soma dos dois canais)
-// 3000 amostras por segundo por canal -> 6000 amostras/seg total
-#define HIGH_RATE_TOTAL_HZ      6000
-#define HIGH_RATE_DURATION_S    2
-#define NUM_CHANNELS            2
-#define NUM_AMOSTRAS_TOTAL      (HIGH_RATE_TOTAL_HZ * HIGH_RATE_DURATION_S)  // 12000
+#define NUM_CHANNELS       8             // 8 canais
+#define SAMPLE_RATE_PER_CHANNEL   3000          // 3000 Hz por canal
+#define HIGH_RATE_TOTAL_HZ    (NUM_CHANNELS * SAMPLE_RATE_PER_CHANNEL) // 24000 amostras/seg total
+#define HIGH_RATE_DURATION_S      1     // 1 segundo
 
-// Configuração do buffer DMA (tamanho em bytes)
-#define DMA_BUFFER_SIZE         4096    // suficiente para centenas de amostras
+// Cálculo sem ponto flutuante: 0.5 s = metade da taxa total
+#define NUM_AMOSTRAS_TOTAL (HIGH_RATE_TOTAL_HZ / 2)   // 24000 / 2 = 12000
+#define DMA_BUFFER_SIZE        8192 
 
 // =========================== CONFIGURAÇÃO DO SD CARD ======================
 #define PIN_NUM_MISO            19
@@ -462,26 +469,25 @@ static void continuous_adc_init(adc_continuous_handle_t *out_handle) {
     //    A frequência total (soma dos canais) será HIGH_RATE_TOTAL_HZ
     adc_continuous_config_t dig_cfg = {
         .sample_freq_hz = HIGH_RATE_TOTAL_HZ,
-        .conv_mode = ADC_CONV_SINGLE_UNIT_1,     // Usa apenas ADC1
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
         .pattern_num = NUM_CHANNELS,
     };
 
-    // Padrão de amostragem: alterna entre os dois canais
+    // Padrão de amostragem: lista de todos os 8 canais do ADC1
     adc_digi_pattern_config_t adc_pattern[NUM_CHANNELS] = {0};
+    adc_channel_t channels[NUM_CHANNELS] = {
+        ADC1_CH0, ADC1_CH1, ADC1_CH2, ADC1_CH3,
+        ADC1_CH4, ADC1_CH5, ADC1_CH6, ADC1_CH7
+    };
+
     for (int i = 0; i < NUM_CHANNELS; i++) {
         adc_pattern[i].atten = ADC_ATTEN_DB;
-        adc_pattern[i].channel = (i == 0) ? ADC_CONTINUOUS_CHAN0 : ADC_CONTINUOUS_CHAN1;
+        adc_pattern[i].channel = channels[i];
         adc_pattern[i].unit = ADC_CONTINUOUS_UNIT;
-        adc_pattern[i].bit_width = ADC_CONTINUOUS_BITWIDTH;   // Nome corrigido
+        adc_pattern[i].bit_width = ADC_CONTINUOUS_BITWIDTH;
     }
     dig_cfg.adc_pattern = adc_pattern;
     ESP_ERROR_CHECK(adc_continuous_config(handle, &dig_cfg));
-
-    // 3. Registra o callback que será chamado quando um frame estiver pronto
-    adc_continuous_evt_cbs_t cbs = {
-        .on_conv_done = continuous_adc_callback,   // função chamada na ISR
-    };
-    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(handle, &cbs, NULL));
 
     *out_handle = handle;
 }
@@ -489,7 +495,7 @@ static void continuous_adc_init(adc_continuous_handle_t *out_handle) {
 // =========================== CALLBACK DO ADC CONTÍNUO (ISR) ===============
 // Esta função roda em contexto de interrupção. Deve ser rápida e não pode
 // chamar funções bloqueantes. Apenas notifica a tarefa de aquisição.
-static bool IRAM_ATTR continuous_adc_callback(adc_continuous_handle_t handle,
+static bool IRAM_ATTR __attribute__((used)) continuous_adc_callback(adc_continuous_handle_t handle,
                                               const adc_continuous_evt_data_t *edata,
                                               void *user_data) {
     BaseType_t mustYield = pdFALSE;
