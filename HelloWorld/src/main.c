@@ -77,14 +77,14 @@
 #define ADC1_CH7                ADC_CHANNEL_7  // GPIO35
 
 // =========================== CONFIGURAÇÃO DO TESTE DE ALTA TAXA ===========
-#define NUM_CHANNELS       8             // 8 canais
-#define SAMPLE_RATE_PER_CHANNEL   3000          // 3000 Hz por canal
-#define HIGH_RATE_TOTAL_HZ    (NUM_CHANNELS * SAMPLE_RATE_PER_CHANNEL) // 24000 amostras/seg total
-#define HIGH_RATE_DURATION_S      1     // 1 segundo
+#define NUM_CHANNELS            8             // 8 canais
+#define SAMPLE_RATE_PER_CHANNEL 3000          // 3000 Hz por canal
+#define HIGH_RATE_TOTAL_HZ      (NUM_CHANNELS * SAMPLE_RATE_PER_CHANNEL) // 24000 amostras/seg total
+#define HIGH_RATE_DURATION_S    1             // 1 segundo
 
-// Cálculo sem ponto flutuante: 0.5 s = metade da taxa total
-#define NUM_AMOSTRAS_TOTAL (HIGH_RATE_TOTAL_HZ / 2)   // 24000 / 2 = 12000
-#define DMA_BUFFER_SIZE        8192 
+// Número total de amostras brutas (24000)
+#define NUM_AMOSTRAS_TOTAL      (HIGH_RATE_TOTAL_HZ * HIGH_RATE_DURATION_S)   // 24000
+#define DMA_BUFFER_SIZE         8192          // Buffer interno do DMA (bytes)
 
 // =========================== CONFIGURAÇÃO DO SD CARD ======================
 #define PIN_NUM_MISO            19
@@ -96,9 +96,16 @@
 // =========================== ESTRUTURA DAS AMOSTRAS =======================
 typedef struct {
     uint32_t time_ms;    // Timestamp em milissegundos
-    uint8_t n_adc;       // Número do canal (0 ou 1)
+    uint8_t n_adc;       // Número do canal (0..7)
     uint16_t adc_value;  // Valor bruto do ADC
 } amostra_t;
+
+// Estrutura compactada (sem padding) para escrita binária
+typedef struct __attribute__((packed)) {
+    uint32_t time_ms;     // 4 bytes
+    uint8_t n_adc;        // 1 byte
+    uint16_t adc_value;   // 2 bytes
+} registro_binario_t;
 
 // =========================== BUFFER DE AMOSTRAS ===========================
 static amostra_t amostras_buffer[NUM_AMOSTRAS_TOTAL]; // Buffer estático em RAM
@@ -124,7 +131,8 @@ static void mostrar_memoria_livre(const char *mensagem);
 static int somar(int a, int b);
 static void verificarPar(int numero);
 static sdmmc_card_t *inicializar_sd_card(void);
-static esp_err_t escrever_csv(const char *caminho_arquivo);
+// static esp_err_t escrever_csv(const char *caminho_arquivo); // CSV comentado
+static esp_err_t escrever_binario(const char *caminho_arquivo);
 static void teste_entrada_saida_serial(void);
 static void teste_leitura_adc_simples(void);
 static void teste_leitura_adc_duplo(void);
@@ -301,12 +309,12 @@ static sdmmc_card_t *inicializar_sd_card(void) {
     return card;
 }
 
+// ================== FUNÇÃO CSV (COMENTADA, NÃO UTILIZADA) =================
+/*
 static esp_err_t escrever_csv(const char *caminho_arquivo) {
     // Abre o arquivo CSV para escrita
     FILE *f = fopen(caminho_arquivo, "w");
     if (f == NULL) {
-        //Mostrar se o erro é, ENOENT (diretório não encontrado), 
-        //ENOSPC (sem espaço), EROFS (somente leitura) ou EINVAL.
         uart_printf("[ERRO] fopen falhou: %s (errno=%d)\n", strerror(errno), errno);
         log_erro("Falha ao criar arquivo CSV");
         return ESP_FAIL;
@@ -317,26 +325,47 @@ static esp_err_t escrever_csv(const char *caminho_arquivo) {
     setvbuf(f, io_buffer, _IOFBF, sizeof(io_buffer));
 
     // Cabeçalho do CSV
-    fprintf(f, "time_ms,n_adc,adc_value\n");    //  Como escrever três colunas respectivamente
-                                                //  time_ms,n_adc,adc_value?
-    // Copia a quantidade total para uma variável local
-    int total = amostras_coletadas;
+    fprintf(f, "time_ms,n_adc,adc_value\n");
 
-    // Percorre o buffer e grava cada linha do CSV  || // Como escrever os valores nas linhas e colunas do CSV,
-    for (int i = 0; i < total; i++) {                       // campos time_ms, n_adc e adc_value?
-        fprintf(
-            f,                                    
-            "%lu,%u,%u\n",                       
-            (unsigned long)amostras_buffer[i].time_ms,
-            amostras_buffer[i].n_adc,
-            amostras_buffer[i].adc_value
-        );
+    int total = amostras_coletadas;
+    for (int i = 0; i < total; i++) {
+        fprintf(f, "%lu,%u,%u\n",
+                (unsigned long)amostras_buffer[i].time_ms,
+                amostras_buffer[i].n_adc,
+                amostras_buffer[i].adc_value);
     }
 
-    // Fecha o arquivo
     fclose(f);
-
     log_info("Arquivo CSV salvo com sucesso!");
+    return ESP_OK;
+}
+*/
+
+// ================== FUNÇÃO DE ESCRITA BINÁRIA =============================
+static esp_err_t escrever_binario(const char *caminho_arquivo) {
+    // Abre o arquivo para escrita binária
+    FILE *f = fopen(caminho_arquivo, "wb");
+    if (f == NULL) {
+        uart_printf("[ERRO] fopen falhou: %s (errno=%d)\n", strerror(errno), errno);
+        log_erro("Falha ao criar arquivo binário");
+        return ESP_FAIL;
+    }
+
+    // Buffer de I/O para escrita rápida (8 kB)
+    static char io_buffer[8192];
+    setvbuf(f, io_buffer, _IOFBF, sizeof(io_buffer));
+
+    int total = amostras_coletadas;
+    // Escreve todo o buffer de uma só vez
+    size_t escritos = fwrite(amostras_buffer, sizeof(amostra_t), total, f);
+    if (escritos != total) {
+        uart_printf("[ERRO] Escrita incompleta: %d de %d registros\n", escritos, total);
+        fclose(f);
+        return ESP_FAIL;
+    }
+
+    fclose(f);
+    log_info("Arquivo binário salvo com sucesso!");
     return ESP_OK;
 }
 
@@ -489,6 +518,12 @@ static void continuous_adc_init(adc_continuous_handle_t *out_handle) {
     dig_cfg.adc_pattern = adc_pattern;
     ESP_ERROR_CHECK(adc_continuous_config(handle, &dig_cfg));
 
+    // 3. Registra o callback que será chamado quando um frame estiver pronto
+    adc_continuous_evt_cbs_t cbs = {
+        .on_conv_done = continuous_adc_callback,
+    };
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(handle, &cbs, NULL));
+
     *out_handle = handle;
 }
 
@@ -550,7 +585,7 @@ static void adc_acquisition_task(void *pvParameters) {
         for (uint32_t i = 0; i < num_samples; i++) {
             if (!g_high_rate_active || coleta_finalizada) break;
 
-            uint8_t canal = parsed[i].channel;  // 0 ou 1 (depende do padrão)
+            uint8_t canal = parsed[i].channel;  // canal real (0..7)
             uint16_t valor = parsed[i].raw_data;
             // Índice global da amostra: total já coletado + i
             int idx = amostras_coletadas + i;
@@ -629,15 +664,16 @@ static void testar_alta_taxa_e_salvar_csv(void) {
 
     mostrar_memoria_livre("Após a coleta");
 
-    // Salva em SD
+    // Salva em SD (em formato binário)
     log_info("Salvando dados no SD...");
     sdmmc_card_t *card = inicializar_sd_card();
     if (card != NULL) {
-        const char *caminho = MOUNT_POINT "/teste_dma.csv";
-        if (escrever_csv(caminho) == ESP_OK) {
-            uart_printf("Arquivo salvo: %s\n", caminho);
+        const char *caminho = MOUNT_POINT "/amostras.bin";
+        if (escrever_binario(caminho) == ESP_OK) {
+            uart_printf("Arquivo binario salvo: %s\n", caminho);
+            uart_printf("Tamanho aproximado: %d bytes\n", (int)(amostras_reais * sizeof(amostra_t)));
         } else {
-            log_erro("Falha ao salvar CSV");
+            log_erro("Falha ao salvar arquivo binario");
         }
         esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
         spi_bus_free(SPI3_HOST);
@@ -771,7 +807,7 @@ void app_main(void) {
 
     adc_oneshot_chan_cfg_t chan_config = {
         .atten = ADC_ATTEN,
-        .bitwidth = ADC_ONESHOT_BITWIDTH,   // Nome corrigido
+        .bitwidth = ADC_ONESHOT_BITWIDTH,
     };
 
     ESP_ERROR_CHECK(adc_oneshot_config_channel(g_oneshot_handle, ADC1_CHAN0, &chan_config));
@@ -798,11 +834,11 @@ void app_main(void) {
         0
     );
 
-    // Core 1: aquisição para o teste de alta taxa
+    // Core 1: aquisição para o teste de alta taxa (stack aumentada para 8192)
     xTaskCreatePinnedToCore(
         adc_acquisition_task,
         "adc_acquisition_task",
-        4096,
+        8192,
         NULL,
         12,
         &g_acquisition_task_handle,
