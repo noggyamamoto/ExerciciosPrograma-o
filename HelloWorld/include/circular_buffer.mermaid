@@ -24,7 +24,7 @@ flowchart TB
     SD["SD Card\nblock_0001\nblock_0002\n..."]
 
     %% Conexões
-    ACQ -->|notificação| BUF
+    ACQ --> BUF
     UI --> WR
-    ACQ --> WR
+    ACQ -->|notificação| WR
     WR --> SD
