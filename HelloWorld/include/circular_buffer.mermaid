@@ -1,0 +1,30 @@
+flowchart TB
+
+    subgraph ESP32["ESP32 (Dual-Core)"]
+
+        direction LR
+
+        %% Core 0
+        subgraph Core0["Core 0"]
+            direction TB
+            UI["Tarefa: Interface \n(comunicação UART, menu)"]
+            WR["Tarefa: Gravação (Consumidor)\n- Espera notificação;\n- Retira bloco do buffer circular;\n- Calcula CRC\n- Grava no SD com o cabeçalho próprio."]
+        end
+
+        %% Core 1
+        subgraph Core1["Core 1"]
+            direction TB
+            ACQ["Tarefa: Aquisição (Produtor)\n-Lê o ADC contínuo (DMA)\n-Preenche bloco atual\n-Quando bloco cheio:\n → insere buffer circular;\n → notifica tarefa de gravação;\n  → troca para o próximo bloco."]
+            BUF["Buffer Circular (FIFO de blocos)\n- Protegido por MUTEX\n- Capacidade: N_BLOCKS blocos"]
+        end
+
+    end
+
+    %% SD fora dos cores (abaixo à esquerda)
+    SD["SD Card\nblock_0001\nblock_0002\n..."]
+
+    %% Conexões
+    ACQ -->|notificação| BUF
+    ACQ --> WR
+    BUF --> WR
+    WR --> SD
