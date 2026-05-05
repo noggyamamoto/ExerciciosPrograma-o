@@ -250,7 +250,7 @@ static sdmmc_card_t *inicializar_sd_card(void) {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI3_HOST; // SPI3 no ESP32
 
-    host.max_freq_khz = 400;
+    host.max_freq_khz = 20000;
 
     // Configura o barramento SPI físico
     spi_bus_config_t bus_cfg = {
